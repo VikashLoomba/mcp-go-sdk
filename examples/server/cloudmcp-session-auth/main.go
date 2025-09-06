@@ -148,20 +148,20 @@ func whoAmI(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.Cal
 }
 
 func main() {
-	flag.Parse()
+    flag.Parse()
 
-	addr := envOrDefault("ADDR", *httpAddr)
-	expectedUserID := envOrDefault("USER_ID", "")
-	getSessionURL := envOrDefault("CLOUDMCP_GET_SESSION_URL", "https://cloudmcp.run/api/auth/mcp/get-session")
+    addr := envOrDefault("ADDR", *httpAddr)
+    expectedUserID := envOrDefault("USER_ID", "")
+    getSessionURL := envOrDefault("CLOUDMCP_GET_SESSION_URL", "https://cloudmcp.run/api/auth/mcp/get-session")
 
-	verifier := NewCloudMCPSessionVerifier(expectedUserID, getSessionURL)
+    verifier := NewCloudMCPSessionVerifier(expectedUserID, getSessionURL)
 
-	// Build MCP server
-	// Install a RootsListChanged handler to propagate client roots to remotes.
-	var (
-		serverOpts mcp.ServerOptions
-		proxy      *ProxyManager
-	)
+    // Build MCP server
+    // Install a RootsListChanged handler to propagate client roots to remotes.
+    var (
+        serverOpts mcp.ServerOptions
+        proxy      *ProxyManager
+    )
 	proxyRootsFn := func(ctx context.Context, req *mcp.RootsListChangedRequest) {
 		if proxy != nil {
 			if err := proxy.HandleLocalRootsChanged(ctx, req.Session); err != nil {
@@ -170,7 +170,56 @@ func main() {
 		}
 	}
 	serverOpts.RootsListChangedHandler = proxyRootsFn
-	server := mcp.NewServer(&mcp.Implementation{Name: "cloudmcp-session-auth", Version: "v1.0.0"}, &serverOpts)
+    server := mcp.NewServer(&mcp.Implementation{Name: "cloudmcp-session-auth", Version: "v1.0.0"}, &serverOpts)
+
+    // Initialize Polar client for usage tracking (optional; no-op if not configured)
+    polarClient := NewPolarClient()
+
+    // Add a receiving middleware to enforce credits BEFORE tool execution
+    server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+        return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+            if method == "tools/call" {
+                var userID string
+                if extra := req.GetExtra(); extra != nil && extra.TokenInfo != nil {
+                    if uid, _ := extra.TokenInfo.Extra["userId"].(string); uid != "" {
+                        userID = uid
+                    }
+                }
+                if err := polarClient.CheckMeterBalance(ctx, userID); err != nil {
+                    // Deny the call with a tool-style error result to the client
+                    return &mcp.CallToolResult{
+                        Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}},
+                        IsError: true,
+                    }, nil
+                }
+            }
+            return next(ctx, method, req)
+        }
+    })
+
+    // Add a receiving middleware to track successful tool calls
+    // This runs after the tool handler completes successfully.
+    server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+        return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+            // Invoke the underlying handler first
+            res, err := next(ctx, method, req)
+
+            // After a successful tools/call, record usage for the authenticated user
+            if method == "tools/call" && err == nil {
+                if ctr, ok := res.(*mcp.CallToolResult); ok && ctr != nil && !ctr.IsError {
+                    if extra := req.GetExtra(); extra != nil && extra.TokenInfo != nil {
+                        // userId is provided by our CloudMCP session verifier in TokenInfo.Extra
+                        if uid, _ := extra.TokenInfo.Extra["userId"].(string); uid != "" {
+                            // Track asynchronously to avoid adding latency to tool calls
+                            go polarClient.TrackUsage(context.Background(), uid)
+                        }
+                    }
+                }
+            }
+
+            return res, err
+        }
+    })
 	mcp.AddTool(server, &mcp.Tool{Name: "whoami", Description: "Return info from verified token/session"}, whoAmI)
 
 	// Create proxy manager for dynamic tool aggregation from other MCP servers.
