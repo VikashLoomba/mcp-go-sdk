@@ -190,6 +190,80 @@ func TestStreamableTransports(t *testing.T) {
 	}
 }
 
+func TestStreamableServerShutdown(t *testing.T) {
+	ctx := context.Background()
+
+	// This test checks that closing the streamable HTTP server actually results
+	// in client session termination, provided one of following holds:
+	//  1. The server is stateful, and therefore the hanging GET fails the connection.
+	//  2. The server is stateless, and the client uses a KeepAlive.
+	tests := []struct {
+		name                 string
+		stateless, keepalive bool
+	}{
+		{"stateful", false, false},
+		{"stateless with keepalive", true, true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := NewServer(testImpl, nil)
+			// Add a tool, just so we can check things are working.
+			AddTool(server, &Tool{Name: "greet"}, sayHi)
+
+			handler := NewStreamableHTTPHandler(
+				func(req *http.Request) *Server { return server },
+				&StreamableHTTPOptions{Stateless: test.stateless})
+
+			// When we shut down the server, we need to explicitly close ongoing
+			// connections. Otherwise, the hanging GET may never terminate.
+			httpServer := httptest.NewUnstartedServer(handler)
+			httpServer.Config.RegisterOnShutdown(func() {
+				for session := range server.Sessions() {
+					session.Close()
+				}
+			})
+			httpServer.Start()
+			defer httpServer.Close()
+
+			// Connect and run a tool.
+			var opts ClientOptions
+			if test.keepalive {
+				opts.KeepAlive = 50 * time.Millisecond
+			}
+			client := NewClient(testImpl, &opts)
+			clientSession, err := client.Connect(ctx, &StreamableClientTransport{
+				Endpoint:   httpServer.URL,
+				MaxRetries: -1, // avoid slow tests during exponential retries
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			params := &CallToolParams{
+				Name:      "greet",
+				Arguments: map[string]any{"name": "foo"},
+			}
+			// Verify that we can call a tool.
+			if _, err := clientSession.CallTool(ctx, params); err != nil {
+				t.Fatalf("CallTool() failed: %v", err)
+			}
+
+			// Shut down the server. Sessions should terminate.
+			go func() {
+				if err := httpServer.Config.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					t.Errorf("closing http server: %v", err)
+				}
+			}()
+
+			// Wait may return an error (after all, the connection failed), but it
+			// should not hang.
+			t.Log("Client waiting")
+			_ = clientSession.Wait()
+		})
+	}
+}
+
 // TestClientReplay verifies that the client can recover from a mid-stream
 // network failure and receive replayed messages (if replay is configured). It
 // uses a proxy that is killed and restarted to simulate a recoverable network
@@ -520,7 +594,7 @@ func TestStreamableServerTransport(t *testing.T) {
 					method:         "POST",
 					messages:       []jsonrpc.Message{req(2, "tools/call", &CallToolParams{Name: "tool"})},
 					wantStatusCode: http.StatusOK,
-					wantMessages:   []jsonrpc.Message{resp(2, &CallToolResult{}, nil)},
+					wantMessages:   []jsonrpc.Message{resp(2, &CallToolResult{Content: []Content{}}, nil)},
 				},
 			},
 		},
@@ -547,14 +621,14 @@ func TestStreamableServerTransport(t *testing.T) {
 					headers:        http.Header{"Accept": {"text/plain", "*/*"}},
 					messages:       []jsonrpc.Message{req(4, "tools/call", &CallToolParams{Name: "tool"})},
 					wantStatusCode: http.StatusOK,
-					wantMessages:   []jsonrpc.Message{resp(4, &CallToolResult{}, nil)},
+					wantMessages:   []jsonrpc.Message{resp(4, &CallToolResult{Content: []Content{}}, nil)},
 				},
 				{
 					method:         "POST",
 					headers:        http.Header{"Accept": {"text/*, application/*"}},
 					messages:       []jsonrpc.Message{req(4, "tools/call", &CallToolParams{Name: "tool"})},
 					wantStatusCode: http.StatusOK,
-					wantMessages:   []jsonrpc.Message{resp(4, &CallToolResult{}, nil)},
+					wantMessages:   []jsonrpc.Message{resp(4, &CallToolResult{Content: []Content{}}, nil)},
 				},
 			},
 		},
@@ -570,6 +644,46 @@ func TestStreamableServerTransport(t *testing.T) {
 					wantStatusCode:     http.StatusBadRequest,
 					wantBodyContaining: "2025-03-26", // a supported version
 					wantSessionID:      false,        // could be true, but shouldn't matter
+				},
+			},
+		},
+		{
+			name: "batch rejected on 2025-06-18",
+			requests: []streamableRequest{
+				initialize,
+				initialized,
+				{
+					method: "POST",
+					// Explicitly set the protocol version header
+					headers: http.Header{"MCP-Protocol-Version": {"2025-06-18"}},
+					// Two messages => batch. Expect reject.
+					messages: []jsonrpc.Message{
+						req(101, "tools/call", &CallToolParams{Name: "tool"}),
+						req(102, "tools/call", &CallToolParams{Name: "tool"}),
+					},
+					wantStatusCode:     http.StatusBadRequest,
+					wantBodyContaining: "batch",
+				},
+			},
+		},
+		{
+			name: "batch accepted on 2025-03-26",
+			requests: []streamableRequest{
+				initialize,
+				initialized,
+				{
+					method:  "POST",
+					headers: http.Header{"MCP-Protocol-Version": {"2025-03-26"}},
+					// Two messages => batch. Expect OK with two responses in order.
+					messages: []jsonrpc.Message{
+						req(201, "tools/call", &CallToolParams{Name: "tool"}),
+						req(202, "tools/call", &CallToolParams{Name: "tool"}),
+					},
+					wantStatusCode: http.StatusOK,
+					wantMessages: []jsonrpc.Message{
+						resp(201, &CallToolResult{Content: []Content{}}, nil),
+						resp(202, &CallToolResult{Content: []Content{}}, nil),
+					},
 				},
 			},
 		},
@@ -592,7 +706,7 @@ func TestStreamableServerTransport(t *testing.T) {
 					wantStatusCode: http.StatusOK,
 					wantMessages: []jsonrpc.Message{
 						req(0, "notifications/progress", &ProgressNotificationParams{}),
-						resp(2, &CallToolResult{}, nil),
+						resp(2, &CallToolResult{Content: []Content{}}, nil),
 					},
 				},
 			},
@@ -624,7 +738,7 @@ func TestStreamableServerTransport(t *testing.T) {
 					wantStatusCode: http.StatusOK,
 					wantMessages: []jsonrpc.Message{
 						req(1, "roots/list", &ListRootsParams{}),
-						resp(2, &CallToolResult{}, nil),
+						resp(2, &CallToolResult{Content: []Content{}}, nil),
 					},
 				},
 			},
@@ -674,7 +788,7 @@ func TestStreamableServerTransport(t *testing.T) {
 					},
 					wantStatusCode: http.StatusOK,
 					wantMessages: []jsonrpc.Message{
-						resp(2, &CallToolResult{}, nil),
+						resp(2, &CallToolResult{Content: []Content{}}, nil),
 					},
 				},
 				{
@@ -1211,7 +1325,7 @@ func TestTokenInfo(t *testing.T) {
 	httpServer := httptest.NewServer(handler)
 	defer httpServer.Close()
 
-	transport := NewStreamableClientTransport(httpServer.URL, nil)
+	transport := &StreamableClientTransport{Endpoint: httpServer.URL}
 	client := NewClient(testImpl, nil)
 	session, err := client.Connect(ctx, transport, nil)
 	if err != nil {
