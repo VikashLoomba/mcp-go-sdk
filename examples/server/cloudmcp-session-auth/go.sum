@@ -2,8 +2,8 @@ github.com/ericlagergren/decimal v0.0.0-20221120152707-495c53812d05 h1:S92OBrGuL
 github.com/ericlagergren/decimal v0.0.0-20221120152707-495c53812d05/go.mod h1:M9R1FoZ3y//hwwnJtO51ypFGwm8ZfpxPT/ZLtO1mcgQ=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
-github.com/google/jsonschema-go v0.2.1-0.20250825175020-748c325cec76 h1:mBlBwtDebdDYr+zdop8N62a44g+Nbv7o2KjWyS1deR4=
-github.com/google/jsonschema-go v0.2.1-0.20250825175020-748c325cec76/go.mod h1:r5quNTdLOYEz95Ru18zA0ydNbBuYoo9tgaYcxEYhJVE=
+github.com/google/jsonschema-go v0.2.2 h1:qb9KM/pATIqIPuE9gEDwPsco8HHCTlA88IGFYHDl03A=
+github.com/google/jsonschema-go v0.2.2/go.mod h1:r5quNTdLOYEz95Ru18zA0ydNbBuYoo9tgaYcxEYhJVE=
 github.com/polarsource/polar-go v0.8.4 h1:O0ZMHzvwYwsRT4vmy2ajiA5TajcuMBJB7fzxwn1W1FE=
 github.com/polarsource/polar-go v0.8.4/go.mod h1:uuE88gTEjIpQtlJoHgPzR3lrIwEiXb8VR9T/VHsaOrI=
 github.com/rs/cors v1.11.1 h1:eU3gRzXLRK57F5rKMGMZURNdIG4EoAmX8k94r9wXWHA=

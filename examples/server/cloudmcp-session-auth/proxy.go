@@ -1688,8 +1688,8 @@ func envEqual(a, b map[string]string) bool {
 // Enabled must contain proxied (prefixed) tool names for this server.
 // If Enabled contains all remote tools (by count), the include/exclude filters are cleared (all enabled).
 type SetEnabledToolsRequest struct {
-    Name    string   `json:"name"`
-    Enabled []string `json:"enabled"`
+	Name    string   `json:"name"`
+	Enabled []string `json:"enabled"`
 }
 
 // HandleSetEnabledTools handles POST /set-enabled-tools.
@@ -1715,64 +1715,64 @@ func (pm *ProxyManager) HandleSetEnabledTools(w http.ResponseWriter, r *http.Req
 
 // SetEnabledTools updates the enabled set for a remote and resyncs.
 func (pm *ProxyManager) SetEnabledTools(ctx context.Context, req *SetEnabledToolsRequest) (*ServerInfo, error) {
-    if req == nil || strings.TrimSpace(req.Name) == "" {
-        return nil, fmt.Errorf("name is required")
-    }
-    pm.mu.Lock()
-    rc := pm.remotes[req.Name]
-    pm.mu.Unlock()
-    if rc == nil {
-        return nil, fmt.Errorf("server not found: %s", req.Name)
-    }
+	if req == nil || strings.TrimSpace(req.Name) == "" {
+		return nil, fmt.Errorf("name is required")
+	}
+	pm.mu.Lock()
+	rc := pm.remotes[req.Name]
+	pm.mu.Unlock()
+	if rc == nil {
+		return nil, fmt.Errorf("server not found: %s", req.Name)
+	}
 
-    // Load all remote tool names for validation and all-enabled test
-    remoteNames, err := rc.listRemoteToolNames(ctx)
-    if err != nil {
-        return nil, err
-    }
-    remoteSet := setFromSlice(remoteNames)
+	// Load all remote tool names for validation and all-enabled test
+	remoteNames, err := rc.listRemoteToolNames(ctx)
+	if err != nil {
+		return nil, err
+	}
+	remoteSet := setFromSlice(remoteNames)
 
-    // Validate that provided names are proxied (start with current prefix) and map back to remote names
-    rc.mu.Lock()
-    prefix := rc.prefix
-    rc.mu.Unlock()
+	// Validate that provided names are proxied (start with current prefix) and map back to remote names
+	rc.mu.Lock()
+	prefix := rc.prefix
+	rc.mu.Unlock()
 
-    trimmed := make([]string, 0, len(req.Enabled))
-    for _, pn := range req.Enabled {
-        if !strings.HasPrefix(pn, prefix) {
-            return nil, fmt.Errorf("invalid tool name %q: expected to start with prefix %q", pn, prefix)
-        }
-        remote := strings.TrimPrefix(pn, prefix)
-        if _, ok := remoteSet[remote]; !ok {
-            return nil, fmt.Errorf("unknown remote tool: %s", remote)
-        }
-        trimmed = append(trimmed, remote)
-    }
+	trimmed := make([]string, 0, len(req.Enabled))
+	for _, pn := range req.Enabled {
+		if !strings.HasPrefix(pn, prefix) {
+			return nil, fmt.Errorf("invalid tool name %q: expected to start with prefix %q", pn, prefix)
+		}
+		remote := strings.TrimPrefix(pn, prefix)
+		if _, ok := remoteSet[remote]; !ok {
+			return nil, fmt.Errorf("unknown remote tool: %s", remote)
+		}
+		trimmed = append(trimmed, remote)
+	}
 
-    // Collision check on the proxied names as provided, excluding our current proxied names
-    exclude := make(map[string]struct{}, len(rc.toolsByProxy))
-    rc.mu.Lock()
-    for name := range rc.toolsByProxy {
-        exclude[name] = struct{}{}
-    }
-    rc.mu.Unlock()
-    if err := pm.checkCollisions(ctx, req.Enabled, exclude); err != nil {
-        return nil, err
-    }
+	// Collision check on the proxied names as provided, excluding our current proxied names
+	exclude := make(map[string]struct{}, len(rc.toolsByProxy))
+	rc.mu.Lock()
+	for name := range rc.toolsByProxy {
+		exclude[name] = struct{}{}
+	}
+	rc.mu.Unlock()
+	if err := pm.checkCollisions(ctx, req.Enabled, exclude); err != nil {
+		return nil, err
+	}
 
-    // Apply filters: if enabling all remote tools, clear include/exclude (default all-enabled)
-    if len(trimmed) == len(remoteNames) {
-        rc.include = nil
-        rc.exclude = nil
-    } else {
-        rc.include = setFromSlice(trimmed)
-        rc.exclude = nil
-    }
+	// Apply filters: if enabling all remote tools, clear include/exclude (default all-enabled)
+	if len(trimmed) == len(remoteNames) {
+		rc.include = nil
+		rc.exclude = nil
+	} else {
+		rc.include = setFromSlice(trimmed)
+		rc.exclude = nil
+	}
 
-    if _, err := rc.syncTools(ctx); err != nil {
-        return nil, err
-    }
-    return rc.info(), nil
+	if _, err := rc.syncTools(ctx); err != nil {
+		return nil, err
+	}
+	return rc.info(), nil
 }
 
 func setFromSlice(v []string) map[string]struct{} {
