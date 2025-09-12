@@ -5,6 +5,7 @@ go 1.23.0
 require (
 	github.com/modelcontextprotocol/go-sdk v0.3.0
 	github.com/polarsource/polar-go v0.8.4
+	github.com/rs/cors v1.11.1
 )
 
 require (

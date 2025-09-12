@@ -18,6 +18,64 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// --- name normalization helpers ---
+
+// sanitizeIdentifier converts an arbitrary string into a safe identifier using
+// the allowed character set [a-z0-9_-]. All letters are lowercased; any other
+// character is replaced with '-'. Runs of separators are collapsed and leading
+// or trailing separators are trimmed. If the result is empty, "remote" is used.
+func sanitizeIdentifier(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return "remote"
+	}
+	// Replace invalid chars with '-'
+	var b strings.Builder
+	b.Grow(len(s))
+	prevSep := false
+	for _, r := range s {
+		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_'
+		if !ok {
+			// separator
+			if !prevSep {
+				b.WriteByte('-')
+				prevSep = true
+			}
+			continue
+		}
+		b.WriteRune(r)
+		prevSep = r == '-' || r == '_'
+	}
+	out := b.String()
+	out = strings.Trim(out, "-_")
+	if out == "" {
+		return "remote"
+	}
+	return out
+}
+
+// normalizePrefix ensures a prefix contains only [a-z0-9_-] and ends with a
+// separator ("-"), suitable for concatenation with tool/prompt names.
+func normalizePrefix(p string, fallbackName string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		p = sanitizeIdentifier(fallbackName) + "-"
+	} else {
+		p = sanitizeIdentifier(p)
+		if p == "" {
+			p = "remote-"
+		}
+		if !strings.HasSuffix(p, "-") && !strings.HasSuffix(p, "_") {
+			p += "-"
+		}
+	}
+	// Prefer '-' as the separator to avoid confusion; convert trailing '_' to '-'
+	if strings.HasSuffix(p, "_") {
+		p = strings.TrimSuffix(p, "_") + "-"
+	}
+	return p
+}
+
 // ProxyManager manages dynamic connections to external MCP servers and
 // proxies their tools through a primary server.
 type ProxyManager struct {
@@ -39,7 +97,7 @@ type AddServerRequest struct {
 	Dir     string            `json:"dir,omitempty"`     // optional working directory
 	Include []string          `json:"include,omitempty"` // optional allowed tool names
 	Exclude []string          `json:"exclude,omitempty"` // optional excluded tool names
-	Prefix  string            `json:"prefix,omitempty"`  // optional prefix for proxied tools (default: name + "/")
+	Prefix  string            `json:"prefix,omitempty"`  // optional prefix for proxied tools/prompts (default: sanitized name + "-")
 }
 
 type RemoveServerRequest struct {
@@ -102,6 +160,74 @@ type RemotePromptArgumentInfo struct {
 	Title       string `json:"title,omitempty"`
 	Description string `json:"description,omitempty"`
 	Required    bool   `json:"required,omitempty"`
+}
+
+// --- health check ---
+
+// ServerHealth summarizes the health of a connected remote server.
+type ServerHealth struct {
+	Name      string `json:"name"`
+	OK        bool   `json:"ok"`
+	LatencyMs int64  `json:"latencyMs,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// HealthResponse is returned by /health.
+type HealthResponse struct {
+	Servers []ServerHealth `json:"servers"`
+}
+
+// HandleHealth handles GET /health by performing an MCP ping against
+// each connected remote server and returning their status.
+func (pm *ProxyManager) HandleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Snapshot current remotes without holding the lock during network calls.
+	pm.mu.Lock()
+	remotes := make([]*remoteClient, 0, len(pm.remotes))
+	for _, rc := range pm.remotes {
+		remotes = append(remotes, rc)
+	}
+	pm.mu.Unlock()
+
+	// Ping concurrently with a short timeout per server.
+	results := make([]ServerHealth, len(remotes))
+	var wg sync.WaitGroup
+	wg.Add(len(remotes))
+	for i, rc := range remotes {
+		i, rc := i, rc
+		go func() {
+			defer wg.Done()
+			name := rc.name
+			// Default to not OK until proven healthy.
+			sh := ServerHealth{Name: name, OK: false}
+			// 2s per-remote timeout
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			start := time.Now()
+			if rc == nil || rc.session == nil {
+				sh.Error = "not connected"
+				results[i] = sh
+				return
+			}
+			if err := rc.session.Ping(ctx, nil); err != nil {
+				sh.Error = err.Error()
+				results[i] = sh
+				return
+			}
+			sh.OK = true
+			sh.LatencyMs = time.Since(start).Milliseconds()
+			results[i] = sh
+		}()
+	}
+	wg.Wait()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&HealthResponse{Servers: results})
 }
 
 // HandleAddServer handles POST /add-server.
@@ -193,10 +319,9 @@ func (pm *ProxyManager) AddServer(ctx context.Context, req *AddServerRequest) (*
 	if req == nil || req.Name == "" || req.Command == "" {
 		return nil, fmt.Errorf("%w: name and command are required", errInvalidRequest)
 	}
-	prefix := req.Prefix
-	if prefix == "" {
-		prefix = req.Name + "/"
-	}
+	// Compute a safe namespace identifier and normalized prefix.
+	safeName := sanitizeIdentifier(req.Name)
+	prefix := normalizePrefix(req.Prefix, safeName)
 
 	pm.mu.Lock()
 	if _, ok := pm.remotes[req.Name]; ok {
@@ -207,6 +332,7 @@ func (pm *ProxyManager) AddServer(ctx context.Context, req *AddServerRequest) (*
 
 	rc := &remoteClient{
 		name:         req.Name,
+		safeName:     safeName,
 		command:      req.Command,
 		args:         append([]string(nil), req.Args...),
 		dir:          req.Dir,
@@ -238,19 +364,22 @@ func (pm *ProxyManager) AddServer(ctx context.Context, req *AddServerRequest) (*
 		return nil, err
 	}
 
-	// Validate prompt name collisions
+	// Validate prompt name collisions (best-effort). If listing prompts is not
+	// supported by the remote, proceed with none instead of failing the add.
 	promptNames, err := rc.listRemotePromptNames(ctx)
 	if err != nil {
-		_ = rc.close()
-		return nil, fmt.Errorf("list remote prompts: %w", err)
+		log.Printf("<%s> listing remote prompts failed; continuing without prompts: %v", rc.name, err)
+		promptNames = nil
 	}
-	proposedPrompts := make([]string, 0, len(promptNames))
-	for _, n := range promptNames {
-		proposedPrompts = append(proposedPrompts, rc.prefix+n)
-	}
-	if err := pm.checkPromptCollisions(ctx, proposedPrompts, nil); err != nil {
-		_ = rc.close()
-		return nil, err
+	if len(promptNames) > 0 {
+		proposedPrompts := make([]string, 0, len(promptNames))
+		for _, n := range promptNames {
+			proposedPrompts = append(proposedPrompts, rc.prefix+n)
+		}
+		if err := pm.checkPromptCollisions(ctx, proposedPrompts, nil); err != nil {
+			_ = rc.close()
+			return nil, err
+		}
 	}
 
 	// Initial sync.
@@ -261,12 +390,12 @@ func (pm *ProxyManager) AddServer(ctx context.Context, req *AddServerRequest) (*
 		return nil, err
 	}
 	if _, err := rc.syncPrompts(ctx); err != nil {
-		_ = rc.close()
-		return nil, err
+		// Do not fail add if prompts are unsupported.
+		log.Printf("<%s> syncing prompts failed; continuing without prompts: %v", rc.name, err)
 	}
 	if _, err := rc.syncResources(ctx); err != nil {
-		_ = rc.close()
-		return nil, err
+		// Do not fail add if resources are unsupported.
+		log.Printf("<%s> syncing resources failed; continuing without resources: %v", rc.name, err)
 	}
 
 	pm.mu.Lock()
@@ -451,14 +580,15 @@ func (pm *ProxyManager) ListServersDetailed(ctx context.Context) *ListServersRes
 // --- remote client management ---
 
 type remoteClient struct {
-	name    string
-	command string
-	args    []string
-	dir     string
-	env     map[string]string
-	include map[string]struct{}
-	exclude map[string]struct{}
-	prefix  string
+	name     string
+	safeName string // sanitized identifier used for proxy URIs/namespace defaults
+	command  string
+	args     []string
+	dir      string
+	env      map[string]string
+	include  map[string]struct{}
+	exclude  map[string]struct{}
+	prefix   string
 
 	server  *mcp.Server
 	client  *mcp.Client
@@ -477,6 +607,32 @@ type remoteClient struct {
 	remoteRoots map[string]struct{} // uri -> present
 
 	mu sync.Mutex
+}
+
+// supportsPrompts reports whether the remote server advertised prompt support
+// in its initialize response capabilities.
+func (rc *remoteClient) supportsPrompts() bool {
+	if rc == nil || rc.session == nil {
+		return false
+	}
+	ir := rc.session.InitializeResult()
+	if ir == nil || ir.Capabilities == nil || ir.Capabilities.Prompts == nil {
+		return false
+	}
+	return true
+}
+
+// supportsResources reports whether the remote server advertised resource
+// support in its initialize response capabilities.
+func (rc *remoteClient) supportsResources() bool {
+	if rc == nil || rc.session == nil {
+		return false
+	}
+	ir := rc.session.InitializeResult()
+	if ir == nil || ir.Capabilities == nil || ir.Capabilities.Resources == nil {
+		return false
+	}
+	return true
 }
 
 func (rc *remoteClient) info() *ServerInfo {
@@ -680,6 +836,10 @@ func (rc *remoteClient) syncPrompts(ctx context.Context) (int, error) {
 	if rc.session == nil {
 		return 0, fmt.Errorf("not connected")
 	}
+	if !rc.supportsPrompts() {
+		// Remote does not support prompts; treat as empty set.
+		return 0, nil
+	}
 	// List prompts (paged)
 	res, err := rc.session.ListPrompts(ctx, nil)
 	if err != nil {
@@ -753,6 +913,10 @@ func (rc *remoteClient) syncResources(ctx context.Context) (int, error) {
 	if rc.session == nil {
 		return 0, fmt.Errorf("not connected")
 	}
+	if !rc.supportsResources() {
+		// Remote does not support resources; treat as empty set.
+		return 0, nil
+	}
 	// List resources
 	res, err := rc.session.ListResources(ctx, nil)
 	if err != nil {
@@ -817,9 +981,9 @@ func (rc *remoteClient) syncResources(ctx context.Context) (int, error) {
 
 // installResourceTemplate installs a catch-all template for this remote to support ad-hoc URIs.
 func (rc *remoteClient) installResourceTemplate() {
-	// URITemplate to match any proxied URI: proxy://<name>/{orig}
+	// URITemplate to match any proxied URI: proxy://<sanitized-server-name>/{orig}
 	tmpl := &mcp.ResourceTemplate{
-		URITemplate: "proxy://" + rc.name + "/{orig}",
+		URITemplate: "proxy://" + rc.safeName + "/{orig}",
 	}
 	rc.server.AddResourceTemplate(tmpl, rc.forwardResourceHandler())
 }
@@ -827,7 +991,7 @@ func (rc *remoteClient) installResourceTemplate() {
 // proxiedURI builds a proxy URI for a remote URI.
 func (rc *remoteClient) proxiedURI(orig string) string {
 	// Percent-encode full original URI into path
-	return "proxy://" + rc.name + "/" + url.PathEscape(orig)
+	return "proxy://" + rc.safeName + "/" + url.PathEscape(orig)
 }
 
 // decodeProxiedURI returns (serverName, original) from a proxied URI, if it matches.
@@ -1031,6 +1195,9 @@ func (rc *remoteClient) listRemotePromptNames(ctx context.Context) ([]string, er
 	if rc.session == nil {
 		return nil, fmt.Errorf("not connected")
 	}
+	if !rc.supportsPrompts() {
+		return []string{}, nil
+	}
 	res, err := rc.session.ListPrompts(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -1062,6 +1229,9 @@ func (rc *remoteClient) listRemotePrompts(ctx context.Context) ([]*mcp.Prompt, e
 	if rc.session == nil {
 		return nil, fmt.Errorf("not connected")
 	}
+	if !rc.supportsPrompts() {
+		return []*mcp.Prompt{}, nil
+	}
 	res, err := rc.session.ListPrompts(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -1084,6 +1254,9 @@ func (rc *remoteClient) listRemoteResources(ctx context.Context) ([]*mcp.Resourc
 	if rc.session == nil {
 		return nil, fmt.Errorf("not connected")
 	}
+	if !rc.supportsResources() {
+		return []*mcp.Resource{}, nil
+	}
 	res, err := rc.session.ListResources(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -1105,6 +1278,9 @@ func (rc *remoteClient) listRemoteResources(ctx context.Context) ([]*mcp.Resourc
 func (rc *remoteClient) listRemoteResourceTemplates(ctx context.Context) ([]*mcp.ResourceTemplate, error) {
 	if rc.session == nil {
 		return nil, fmt.Errorf("not connected")
+	}
+	if !rc.supportsResources() {
+		return []*mcp.ResourceTemplate{}, nil
 	}
 	res, err := rc.session.ListResourceTemplates(ctx, nil)
 	if err != nil {
@@ -1299,7 +1475,7 @@ func (pm *ProxyManager) UpdateServer(ctx context.Context, req *UpdateServerReque
 	// Build new config based on existing rc
 	newPrefix := rc.prefix
 	if req.Prefix != nil {
-		newPrefix = *req.Prefix
+		newPrefix = normalizePrefix(*req.Prefix, sanitizeIdentifier(rc.name))
 	}
 	newInclude := rc.include
 	if req.Include != nil {
@@ -1336,6 +1512,7 @@ func (pm *ProxyManager) UpdateServer(ctx context.Context, req *UpdateServerReque
 	if restart {
 		tmp := &remoteClient{
 			name:         rc.name,
+			safeName:     rc.safeName,
 			command:      newCommand,
 			args:         newArgs,
 			dir:          newDir,
@@ -1508,10 +1685,11 @@ func envEqual(a, b map[string]string) bool {
 }
 
 // SetEnabledToolsRequest updates the enabled set for a remote server.
-// If Enabled contains all remote tools, the include/exclude filters are cleared (all enabled).
+// Enabled must contain proxied (prefixed) tool names for this server.
+// If Enabled contains all remote tools (by count), the include/exclude filters are cleared (all enabled).
 type SetEnabledToolsRequest struct {
-	Name    string   `json:"name"`
-	Enabled []string `json:"enabled"`
+    Name    string   `json:"name"`
+    Enabled []string `json:"enabled"`
 }
 
 // HandleSetEnabledTools handles POST /set-enabled-tools.
@@ -1537,58 +1715,64 @@ func (pm *ProxyManager) HandleSetEnabledTools(w http.ResponseWriter, r *http.Req
 
 // SetEnabledTools updates the enabled set for a remote and resyncs.
 func (pm *ProxyManager) SetEnabledTools(ctx context.Context, req *SetEnabledToolsRequest) (*ServerInfo, error) {
-	if req == nil || strings.TrimSpace(req.Name) == "" {
-		return nil, fmt.Errorf("name is required")
-	}
-	pm.mu.Lock()
-	rc := pm.remotes[req.Name]
-	pm.mu.Unlock()
-	if rc == nil {
-		return nil, fmt.Errorf("server not found: %s", req.Name)
-	}
+    if req == nil || strings.TrimSpace(req.Name) == "" {
+        return nil, fmt.Errorf("name is required")
+    }
+    pm.mu.Lock()
+    rc := pm.remotes[req.Name]
+    pm.mu.Unlock()
+    if rc == nil {
+        return nil, fmt.Errorf("server not found: %s", req.Name)
+    }
 
-	// Validate requested names against actual remote tools and compute collisions
-	remoteNames, err := rc.listRemoteToolNames(ctx)
-	if err != nil {
-		return nil, err
-	}
-	remoteSet := setFromSlice(remoteNames)
-	// Ensure all requested names exist remotely
-	for _, n := range req.Enabled {
-		if _, ok := remoteSet[n]; !ok {
-			return nil, fmt.Errorf("unknown remote tool: %s", n)
-		}
-	}
+    // Load all remote tool names for validation and all-enabled test
+    remoteNames, err := rc.listRemoteToolNames(ctx)
+    if err != nil {
+        return nil, err
+    }
+    remoteSet := setFromSlice(remoteNames)
 
-	// Compute proposed proxied names for enabled set and check collisions (excluding our current proxied names)
-	exclude := make(map[string]struct{}, len(rc.toolsByProxy))
-	rc.mu.Lock()
-	for name := range rc.toolsByProxy {
-		exclude[name] = struct{}{}
-	}
-	prefix := rc.prefix
-	rc.mu.Unlock()
-	proposed := make([]string, 0, len(req.Enabled))
-	for _, n := range req.Enabled {
-		proposed = append(proposed, prefix+n)
-	}
-	if err := pm.checkCollisions(ctx, proposed, exclude); err != nil {
-		return nil, err
-	}
+    // Validate that provided names are proxied (start with current prefix) and map back to remote names
+    rc.mu.Lock()
+    prefix := rc.prefix
+    rc.mu.Unlock()
 
-	// Apply filters: if enabling all remote tools, clear include/exclude (default all-enabled)
-	if len(req.Enabled) == len(remoteNames) {
-		rc.include = nil
-		rc.exclude = nil
-	} else {
-		rc.include = setFromSlice(req.Enabled)
-		rc.exclude = nil
-	}
+    trimmed := make([]string, 0, len(req.Enabled))
+    for _, pn := range req.Enabled {
+        if !strings.HasPrefix(pn, prefix) {
+            return nil, fmt.Errorf("invalid tool name %q: expected to start with prefix %q", pn, prefix)
+        }
+        remote := strings.TrimPrefix(pn, prefix)
+        if _, ok := remoteSet[remote]; !ok {
+            return nil, fmt.Errorf("unknown remote tool: %s", remote)
+        }
+        trimmed = append(trimmed, remote)
+    }
 
-	if _, err := rc.syncTools(ctx); err != nil {
-		return nil, err
-	}
-	return rc.info(), nil
+    // Collision check on the proxied names as provided, excluding our current proxied names
+    exclude := make(map[string]struct{}, len(rc.toolsByProxy))
+    rc.mu.Lock()
+    for name := range rc.toolsByProxy {
+        exclude[name] = struct{}{}
+    }
+    rc.mu.Unlock()
+    if err := pm.checkCollisions(ctx, req.Enabled, exclude); err != nil {
+        return nil, err
+    }
+
+    // Apply filters: if enabling all remote tools, clear include/exclude (default all-enabled)
+    if len(trimmed) == len(remoteNames) {
+        rc.include = nil
+        rc.exclude = nil
+    } else {
+        rc.include = setFromSlice(trimmed)
+        rc.exclude = nil
+    }
+
+    if _, err := rc.syncTools(ctx); err != nil {
+        return nil, err
+    }
+    return rc.info(), nil
 }
 
 func setFromSlice(v []string) map[string]struct{} {

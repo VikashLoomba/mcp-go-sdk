@@ -1,0 +1,44 @@
+# This is a template fly.toml for MCP server instances
+# It will be used by the frontend to create new VMs
+
+app = "mcp-manager"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  # TARGET_MCP_COMMAND and TARGET_MCP_ARGS will be set by the frontend
+  # when creating the VM based on user's configuration
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+[[services.http_checks]]
+  interval = 10000
+  grace_period = "5s"
+  method = "get"
+  path = "/healthcheck"
+  protocol = "http"
+  timeout = 2000
+  tls_skip_verify = false
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[mounts]
+  source = "mcp_data"
+  destination = "/mcp"
